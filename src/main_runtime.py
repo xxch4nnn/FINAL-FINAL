@@ -5,7 +5,7 @@ Merges Vision (Phase 1), ML Model (Phase 2), and Audio Engine.
 
 Features:
 - Threaded Video Capture (High Performance)
-- Live Feature Extraction (replicating SyncPianoMotionDataset.py)
+- Live Feature Extraction (replicating SyncPianoMotionDataset.py via feature_engine)
 - Random Forest Inference (or Heuristic Fallback)
 - Low-Latency Audio (Pygame + Synth)
 - Virtual Piano Projection (ArUco)
@@ -24,6 +24,13 @@ from collections import deque
 from pathlib import Path
 from scipy.signal import savgol_filter
 
+# Import shared feature engine
+try:
+    from feature_engine import LiveFeatureExtractor, FEATURE_COLUMNS
+except ImportError:
+    sys.path.append(str(Path(__file__).parent))
+    from feature_engine import LiveFeatureExtractor, FEATURE_COLUMNS
+
 # --- CONFIGURATION ---
 CONFIG = {
     'CAM_ID': 0,
@@ -37,7 +44,7 @@ CONFIG = {
     'HISTORY_LAG': 6,    # For lag features
     'PROB_THRESHOLD': 0.5,
     'DEBOUNCE_FRAMES': 3,
-    'MODELS_DIR': Path("Machine_Learning_Course/Data/PianoMotion10M/models"),
+    'MODELS_DIR': Path(__file__).parent.parent / "models",
     'SCALER_NAME': "scaler.pkl",
     'MODEL_NAME': "rf_model.pkl",
     'FEATURES_NAME': "selected_features.pkl"
@@ -159,35 +166,17 @@ class ThreadedCamera:
         if self.cap.isOpened():
             self.cap.release()
 
-# --- LIVE FEATURE EXTRACTOR ---
-class LiveFeatureExtractor:
+# --- PREDICTION WRAPPER ---
+class PianoMotionPredictor:
     """
-    Congruent Feature Extractor.
-    Buffers 10 frames of MediaPipe Landmarks.
-    Calculates derivatives, averages, and lags.
-    Matches SyncPianoMotionDataset.py output exactly.
+    Wraps the LiveFeatureExtractor and the Model.
     """
     def __init__(self):
-        self.buffer = deque(maxlen=CONFIG['BUFFER_SIZE'])
+        self.extractor = LiveFeatureExtractor(buffer_size=CONFIG['BUFFER_SIZE'])
+        self.model = None
         self.scaler = None
         self.selected_features = None
-        self.model = None
         self.has_model = False
-        
-        self.feature_names = [
-            'finger_pos_x', 'finger_pos_y', 'wrist_pos_x', 'wrist_pos_y',
-            'finger_vel_x', 'finger_vel_y', 'finger_speed',
-            'wrist_vel_x', 'wrist_vel_y', 'wrist_speed',
-            'finger_acc_x', 'finger_acc_y', 'finger_acc_mag',
-            'rel_finger_pos_x', 'rel_finger_pos_y',
-            'rel_finger_vel_x', 'rel_finger_vel_y',
-            'dist_wrist', 'dist_palm', 'posture_dist',
-            'rel_depth',
-            'avg_speed', 'avg_acc_mag',
-            'lag_speed_2', 'lag_speed_4', 'lag_speed_6',
-            'rolling_var_speed'
-        ]
-
         self._load_artifacts()
 
     def _load_artifacts(self):
@@ -203,198 +192,59 @@ class LiveFeatureExtractor:
                 self.has_model = True
                 logger.info("ML Models Loaded Successfully.")
             else:
-                logger.warning("ML Models NOT found. Using Heuristic Fallback.")
+                logger.warning(f"ML Models NOT found at {CONFIG['MODELS_DIR']}. Using Heuristic Fallback.")
         except Exception as e:
             logger.error(f"Failed to load ML artifacts: {e}")
             self.has_model = False
 
     def update(self, landmarks):
-        """
-        Push new landmarks to buffer.
-        landmarks: MediaPipe NormalizedLandmarkList (or compatible object)
-        """
-        if not landmarks:
-            return
+        self.extractor.update(landmarks)
 
-        frame_data = {
-            'wrist': np.array([landmarks[0].x, landmarks[0].y, landmarks[0].z]),
-            'tip': np.array([landmarks[8].x, landmarks[8].y, landmarks[8].z]),
-            'dip': np.array([landmarks[7].x, landmarks[7].y, landmarks[7].z]),
-            'palm': np.array([landmarks[9].x, landmarks[9].y, landmarks[9].z]) # Using 9 as proxy
-        }
-        self.buffer.append(frame_data)
-
-    def extract(self):
-        """
-        Calculates features from buffer.
-        Returns: (1, N_FEATURES) array or None if buffering.
-        """
-        if len(self.buffer) < 5: # Need minimal history for smoothing/vel
-            return None
-
-        # Convert buffer to arrays
-        # Shape: (T, 3)
-        wrist_hist = np.array([d['wrist'] for d in self.buffer])
-        tip_hist = np.array([d['tip'] for d in self.buffer])
-        dip_hist = np.array([d['dip'] for d in self.buffer])
-        palm_hist = np.array([d['palm'] for d in self.buffer])
-
-        # --- Congruent Logic with SyncPianoMotionDataset ---
+    def predict(self):
+        # Extract 1 vector
+        vec = self.extractor.extract() # (1, F)
         
-        # 1. Smooth Positions (SavGol) - Optional but good
-        # Using simple mean for robustness in small buffer if SavGol fails
-        try:
-            tip_s = savgol_filter(tip_hist[:, :2], window_length=5, polyorder=2, axis=0)
-            wrist_s = savgol_filter(wrist_hist[:, :2], window_length=5, polyorder=2, axis=0)
-        except:
-            tip_s = tip_hist[:, :2]
-            wrist_s = wrist_hist[:, :2]
-
-        # 2. Calculate Derivatives (dt = 1/30)
-        # Using last frame as 'current'
-        dt = 1.0 / 30.0
-        
-        # Velocity
-        tip_v = np.gradient(tip_s, axis=0) / dt
-        wrist_v = np.gradient(wrist_s, axis=0) / dt
-        
-        # Acceleration
-        tip_a = np.gradient(tip_v, axis=0) / dt
-
-        # Current Frame Indices
-        curr = -1 # Last element
-
-        # Extract Values
-        t_p = tip_s[curr]
-        t_v = tip_v[curr]
-        t_a = tip_a[curr]
-        w_p = wrist_s[curr]
-        w_v = wrist_v[curr]
-        
-        # Relative Depth (Tip Z - Wrist Z) - using raw MP Z
-        # MP Z is relative to wrist roughly.
-        rel_depth = tip_hist[curr, 2] - wrist_hist[curr, 2]
-
-        # Construct Dictionary
-        feat = {}
-        
-        # Position
-        feat['finger_pos_x'] = t_p[0]
-        feat['finger_pos_y'] = t_p[1]
-        feat['wrist_pos_x'] = w_p[0]
-        feat['wrist_pos_y'] = w_p[1]
-        
-        # Velocity
-        feat['finger_vel_x'] = t_v[0]
-        feat['finger_vel_y'] = t_v[1]
-        feat['finger_speed'] = np.linalg.norm(t_v)
-        
-        feat['wrist_vel_x'] = w_v[0]
-        feat['wrist_vel_y'] = w_v[1]
-        feat['wrist_speed'] = np.linalg.norm(w_v)
-        
-        # Acceleration
-        feat['finger_acc_x'] = t_a[0]
-        feat['finger_acc_y'] = t_a[1]
-        feat['finger_acc_mag'] = np.linalg.norm(t_a)
-        
-        # Relative
-        feat['rel_finger_pos_x'] = t_p[0] - w_p[0]
-        feat['rel_finger_pos_y'] = t_p[1] - w_p[1]
-        feat['rel_finger_vel_x'] = t_v[0] - w_v[0]
-        feat['rel_finger_vel_y'] = t_v[1] - w_v[1]
-        
-        # Distances
-        feat['dist_wrist'] = np.linalg.norm(t_p - w_p)
-        feat['dist_palm'] = np.linalg.norm(t_p - palm_hist[curr, :2])
-        feat['posture_dist'] = np.linalg.norm(t_p - dip_hist[curr, :2])
-        
-        # Depth
-        feat['rel_depth'] = rel_depth
-        
-        # Rolling Averages (Last 5)
-        # Buffer slice
-        start_idx = max(0, len(self.buffer) - 5)
-        recent_speeds = np.linalg.norm(tip_v[start_idx:], axis=1)
-        recent_accs = np.linalg.norm(tip_a[start_idx:], axis=1)
-        
-        feat['avg_speed'] = np.mean(recent_speeds)
-        feat['avg_acc_mag'] = np.mean(recent_accs)
-        feat['rolling_var_speed'] = np.var(recent_speeds)
-
-        # Lags
-        # We need historical values. Buffer index logic:
-        # curr = len-1. Lag L means index = len-1 - L
-        for lag in [2, 4, 6]:
-            idx = len(self.buffer) - 1 - lag
-            if idx >= 0:
-                feat[f'lag_speed_{lag}'] = np.linalg.norm(tip_v[idx])
-            else:
-                feat[f'lag_speed_{lag}'] = 0.0
-
-        # Create Vector (Congruent Order?)
-        # Best to use DataFrame to align with feature list
-        # But for speed, we iterate list
-        vector = []
-        # If we have selected features, use those keys
-        # If not, use all computed keys that match known list
-        
-        # NOTE: If we have model, we MUST use 'selected_features' order
-        keys_to_use = self.selected_features if self.has_model and self.selected_features is not None else self.feature_names
-        
-        # Check if keys are missing from feat (e.g. if RFE selected something weird)
-        # Using 0.0 for missing
-        for k in keys_to_use:
-            vector.append(feat.get(k, 0.0))
-            
-        return np.array([vector]) # Shape (1, F)
-
-    def predict(self, feature_vector):
-        """
-        Inference Step.
-        Returns: Class ID (0=Hover, 1=Press, 2=Hold, 3=Release)
-        """
-        if feature_vector is None:
-            return 0 # Default Hover
+        if vec is None:
+            return 0 # Buffering
 
         if self.has_model:
             try:
+                # Filter to selected features if needed
+                # The vec currently contains ALL features in FEATURE_COLUMNS order.
+                # If model was trained on a subset (RFE), we must filter.
+
+                # Create DataFrame for name-based indexing
+                import pandas as pd
+                df = pd.DataFrame(vec, columns=FEATURE_COLUMNS)
+
+                # Select only trained features
+                if self.selected_features is not None:
+                    # Check overlap
+                    valid_feats = [f for f in self.selected_features if f in df.columns]
+                    X_input = df[valid_feats]
+                else:
+                    X_input = df
+
                 # Scale
-                X_scaled = self.scaler.transform(feature_vector)
+                X_scaled = self.scaler.transform(X_input)
+
                 # Predict
-                prob = self.model.predict_proba(X_scaled)[0] # (4,)
+                prob = self.model.predict_proba(X_scaled)[0]
                 pred = np.argmax(prob)
                 
-                # Probability Gating (Optional)
-                if prob[1] > CONFIG['PROB_THRESHOLD']: # Confident Press
+                if prob[1] > CONFIG['PROB_THRESHOLD']:
                     return 1
                 elif pred == 1 and prob[1] < CONFIG['PROB_THRESHOLD']:
-                    return 0 # Suppress weak press
+                    return 0
                 
                 return pred
             except Exception as e:
                 # logger.error(f"Prediction Error: {e}")
                 pass
         
-        # Fallback Heuristic
-        # Simple Z-velocity check (using feature vector if possible, or raw)
-        # We can't easily extract z-vel from vector without mapping.
-        # So we trust the caller or return a dumb value.
-        # But wait! I can just check the Z-velocity if I knew where it was.
-        # It's 'finger_vel_x' etc. I don't have Z-vel explicitly in feature vector 
-        # (Wait, I only have 2D vel in 'finger_vel_x/y').
-        # Actually I do NOT have 'finger_vel_z' in the feature list.
-        # The ML model relies on `rel_depth` and `avg_speed`.
-        # So simple fallback: If `rel_depth` (normalized) < Threshold?
-        # MP Z: Negative is closer? Wait. Z is rel to wrist.
-        # Wrist=0. Tip < 0 means Tip closer to camera than Wrist (if palm facing cam).
-        # In Piano posture, hand is prone. Camera above.
-        # Wrist is "high". Tip is "low" (further from cam).
-        # So Tip Z > Wrist Z (Positive Z).
-        # Larger Positive Z = Deeper = Pressed?
-        # Let's say Threshold > 0.1?
-        # I'll stick to returning 0 if model fails, to be safe.
+        # Fallback (simple)
         return 0
+
 
 # --- MAIN RUNTIME ---
 
@@ -411,9 +261,7 @@ def get_hand_in_aruco_space(hand_norm, rvec, tvec, cam_mat, dist_coeffs):
     u = hand_norm[0] * CONFIG['WIDTH']
     v = hand_norm[1] * CONFIG['HEIGHT']
     
-    # Simple Pinhole Inverse (assuming low distortion for speed, or use undistortPoints)
-    # x_c = (u - cx)/fx * z_c
-    # y_c = (v - cy)/fy * z_c
+    # Simple Pinhole Inverse
     fx = cam_mat[0, 0]
     fy = cam_mat[1, 1]
     cx = cam_mat[0, 2]
@@ -425,16 +273,6 @@ def get_hand_in_aruco_space(hand_norm, rvec, tvec, cam_mat, dist_coeffs):
     ray_cam = np.array([x_ray, y_ray, z_ray]) # Direction vector
     
     # 2. Plane Intersection
-    # Plane defined by ArUco: R*P_aruco + t = P_cam
-    # We want P_aruco where P_aruco.z = 0 (on the table/paper)
-    # P_cam = R * [x_a, y_a, 0] + t
-    # P_cam = x_a * R_col0 + y_a * R_col1 + t
-    # Also P_cam = lambda * ray_cam
-    
-    # System of equations:
-    # lambda * ray_cam = x_a * r1 + y_a * r2 + t
-    # [r1, r2, -ray_cam] * [x_a, y_a, lambda]^T = -t
-    
     R, _ = cv2.Rodrigues(rvec)
     r1 = R[:, 0]
     r2 = R[:, 1]
@@ -445,8 +283,6 @@ def get_hand_in_aruco_space(hand_norm, rvec, tvec, cam_mat, dist_coeffs):
     try:
         sol = np.linalg.solve(A, b)
         x_a = sol[0]
-        # y_a = sol[1]
-        # lambda_val = sol[2]
         return x_a
     except:
         return None
@@ -455,7 +291,7 @@ def main():
     # Init Modules
     cam = ThreadedCamera(CONFIG['CAM_ID'])
     audio = SoundEngine()
-    features = LiveFeatureExtractor()
+    predictor = PianoMotionPredictor()
     
     # CV2 / MediaPipe
     mp_hands = mp.solutions.hands
@@ -538,11 +374,10 @@ def main():
                 mp.solutions.drawing_utils.draw_landmarks(vis_frame, results.multi_hand_landmarks[0], mp_hands.HAND_CONNECTIONS)
                 
                 # Update Features
-                features.update(lm)
+                predictor.update(lm)
                 
-                # Extract & Predict
-                vec = features.extract() # (1, F)
-                state = features.predict(vec) # 0, 1, 2, 3
+                # Predict
+                state = predictor.predict() # 0, 1, 2, 3
                 
                 # 4. Trigger Logic (Debounced in mind, or simple state change)
                 # PRESS (1) or HOLD (2)? Usually sound on 0->1 or 0->2
